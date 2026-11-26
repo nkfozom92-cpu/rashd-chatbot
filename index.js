@@ -1,692 +1,754 @@
-require('dotenv').config();
-const express = require('express');
-const axios   = require('axios');
-const pino    = require('pino');
-const path    = require('path');
-const fs      = require('fs');
 
-const app  = express();
+require('dotenv').config();
+
+const express = require('express');
+const axios = require('axios');
+const pino = require('pino');
+const path = require('path');
+const fs = require('fs');
+
+const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Auth directory: uses env var or falls back to __dirname/auth_info ──
-// On Render with persistent disk mounted at /opt/render/project/src/auth_info
-// this relative resolution works perfectly.
 const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
-// ── TALHA THE AI System Prompt ──
-const SYSTEM_PROMPT = `তুমি হলে "TALHA THE AI" — একজন বন্ধু এবং সাহায্যকারী।
+const GEMINI_URL =
+`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
 
-তোমার ব্যক্তিত্ব:
-- তুমি ব্যবহারকারীর একজন বিশ্বস্ত বন্ধু এবং সব সময় সাহায্যের জন্য প্রস্তুত।
-- তুমি যেকোনো প্রশ্নের সঠিক ও বিস্তারিত উত্তর দিতে পারো — পড়াশোনা, কোডিং, রান্না, ভ্রমণ, স্বাস্থ্য, বিনোদন, প্রযুক্তি, যা কিছু হোক।
-- কেউ সাহায্য চাইলে তুমি বন্ধুর মতো কথা বলো — উষ্ণ, ধৈর্যশীল ও আন্তরিকভাবে।
-- তুমি বাংলা, English বা যেকোনো ভাষায় উত্তর দিতে পারো — যেই ভাষায় ব্যবহারকারী লেখে তুমিও সেই ভাষায় উত্তর দিও।
+const SYSTEM_PROMPT = `
+তুমি TALHA THE AI।
+তুমি একজন বন্ধুসুলভ, বুদ্ধিমান এবং সাহায্যকারী AI Assistant।
 
-ছবি তৈরি (Image Generation):
-- যদি ব্যবহারকারী কোনো ছবি তৈরি করতে বলে (যেমনঃ "ছবি বানাও", "image বানাও", "draw", "generate image"), তুমি তাদের /image কমান্ডের কথা বলো।
-- উদাহরণঃ "/image একটা সূর্যাস্তের ছবি" — এভাবে লিখলেই আমি ছবি তৈরি করে দেব।
+নিয়ম:
+- বাংলা, English, Hindi সহ বিভিন্ন ভাষায় উত্তর দেবে।
+- ব্যবহারকারীর ভাষায় উত্তর দেবে।
+- কোডিং, প্রযুক্তি, পড়াশোনা, সাধারণ জ্ঞানসহ বিভিন্ন বিষয়ে সাহায্য করবে।
+- ভুল তথ্য বানিয়ে বলবে না।
+- উত্তর পরিষ্কার ও সহজবোধ্য রাখবে।
+- ছবি তৈরির অনুরোধ করলে /image কমান্ড ব্যবহারের কথা বলবে।
+`;
 
-সর্বদা সংক্ষিপ্ত, পরিষ্কার ও সহায়ক উত্তর দাও। মিথ্যা তথ্য দিও না — না জানলে সরাসরি বলে দাও।`;
-
-// ── State ──
-let logs      = ['🚀 TALHA THE AI starting up...'];
-let pairingCode  = null;
-let waConnected  = false;
-let waSocket     = null;
-let waStarting   = false;
+let logs = [];
+let waSocket = null;
+let waConnected = false;
+let waStarting = false;
+let pairingCode = null;
 let waPhoneNumber = null;
 let reconnectAttempts = 0;
+let reconnectTimer = null;
+let botStartPromise = null;
 
-function pushLog(msg) {
-    const ts = new Date().toLocaleTimeString('bn-BD');
-    logs.push(`[${ts}] ${msg}`);
-    if (logs.length > 200) logs = logs.slice(-200);
-    console.log(msg);
+function log(message) {
+    const line = `[${new Date().toISOString()}] ${message}`;
+    logs.push(line);
+    if (logs.length > 200) logs.shift();
+    console.log(line);
 }
 
-function escapeHtml(s) {
-    return String(s)
+function escapeHtml(value) {
+    return String(value)
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
-// ── Detect image generation requests ──
-function extractImagePrompt(text) {
-    const trimmed = text.trim();
-    const cmdMatch = trimmed.match(/^\/(image|img|imagine)\s+(.+)/i);
-    if (cmdMatch) return cmdMatch[2].trim();
-    const patterns = [
-        /^(?:একটা |একটি )?(.+?)(?:\s*-?এর)?\s*(?:ছবি|পিকচার|পিক)\s*(?:বানাও|তৈরি কর|দাও|দে|generate|বানা)/i,
-        /^(?:draw|generate|make|create)\s+(?:an?\s+)?(?:image|picture|photo)\s+(?:of\s+)?(.+)/i,
-        /^(?:ছবি|image|picture)\s*[:\-]\s*(.+)/i,
-    ];
-    for (const re of patterns) {
-        const m = trimmed.match(re);
-        if (m && m[1]) return m[1].trim();
+// ADMIN AUTHENTICATION
+function requireAdmin(req, res, next) {
+    if (!ADMIN_TOKEN) {
+        return res.status(503).json({
+            error: 'ADMIN_TOKEN সেট করা নেই।'
+        });
     }
+
+    const token =
+        req.headers['x-admin-token'] ||
+        req.body?.adminToken ||
+        '';
+
+    if (token !== ADMIN_TOKEN) {
+        return res.status(401).json({
+            error: 'Invalid Admin Token'
+        });
+    }
+
+    next();
+}
+
+app.use(express.json({ limit: '512kb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// IMAGE REQUEST DETECTION
+function getImagePrompt(text) {
+    const match = text.trim().match(
+        /^\/(?:image|img|imagine)\s+([\s\S]+)/i
+    );
+
+    if (match) return match[1].trim();
+
     return null;
 }
 
+// GEMINI AI
+async function askAI(message) {
+    if (!GEMINI_API_KEY) {
+        log('ERROR: GEMINI_API_KEY missing');
+        return 'Gemini API Key পাওয়া যাচ্ছে না।';
+    }
 
-// ── AI API ──
-const API_URL =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
-
-async function askAI(userMessage) {
     try {
-        const API_KEY = process.env.GEMINI_API_KEY;
-
-        if (!API_KEY) {
-            throw new Error("GEMINI_API_KEY is missing");
-        }
-
-        const res = await axios.post(
-            API_URL,
+        const response = await axios.post(
+            GEMINI_URL,
             {
                 systemInstruction: {
                     parts: [{ text: SYSTEM_PROMPT }]
                 },
-                contents: [
-                    {
-                        role: "user",
-                        parts: [{ text: userMessage }]
-                    }
-                ],
+                contents: [{
+                    role: 'user',
+                    parts: [{ text: message }]
+                }],
                 generationConfig: {
+                    temperature: 0.7,
                     maxOutputTokens: 2048
                 }
             },
             {
                 headers: {
-                    "Content-Type": "application/json",
-                    "x-goog-api-key": API_KEY
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': GEMINI_API_KEY
                 },
-                timeout: 30000
+                timeout: 60000
             }
         );
 
-        return res.data?.candidates?.[0]?.content?.parts
-            ?.map(part => part.text || "")
-            .join("")
-            || "⚠️ কোনো উত্তর পাওয়া যায়নি।";
+        const answer = response.data?.candidates?.[0]
+            ?.content?.parts
+            ?.map(part => part.text || '')
+            .join('')
+            .trim();
 
-    } catch (err) {
-        pushLog("❌ AI Error: " +
-            (err.response?.status || err.message));
-
-        return "⚠️ দুঃখিত, AI সার্ভারে সমস্যা হচ্ছে। একটু পরে আবার চেষ্টা করুন।";
-    }
-}
-
-
-// ── Image generation via Pollinations (free, no key needed) ──
-function imageUrlFor(prompt) {
-    const encoded = encodeURIComponent(prompt);
-    const seed    = Math.floor(Math.random() * 1_000_000);
-    return `https://image.pollinations.ai/prompt/${encoded}?width=1024&height=1024&nologo=true&seed=${seed}`;
-}
-
-async function fetchImageBuffer(prompt, attempts = 4) {
-    let lastErr;
-    for (let i = 0; i < attempts; i++) {
-        const url = imageUrlFor(prompt);
-        try {
-            const res = await axios.get(url, {
-                responseType: 'arraybuffer',
-                timeout: 90_000,
-                headers: { 'User-Agent': 'RASHD-THE-AI/2.0' },
-            });
-            if (res.data && res.data.byteLength > 1000) return Buffer.from(res.data);
-            throw new Error('empty image response');
-        } catch (e) {
-            lastErr = e;
-            const status = e.response?.status;
-            const wait   = status === 429 ? 5000 + i * 3000 : 2500 + i * 2000;
-            pushLog(`⚠️ Image attempt ${i + 1}/${attempts} (${status || e.code || e.message}). Retry in ${wait}ms`);
-            await new Promise(r => setTimeout(r, wait));
+        if (!answer) {
+            log('Gemini returned an empty response');
+            return 'দুঃখিত, AI উত্তর তৈরি করতে পারেনি।';
         }
+
+        log('Gemini API SUCCESS');
+        return answer;
+
+    } catch (error) {
+        const status = error.response?.status || 'NETWORK';
+        const detail =
+            error.response?.data?.error?.message ||
+            error.message;
+
+        log(`GEMINI ERROR ${status}: ${detail}`);
+
+        return `দুঃখিত, Gemini API Error (${status})।`;
     }
-    throw lastErr || new Error('image generation failed after all attempts');
 }
 
-// ── EXPRESS middleware ──
-app.use(express.json({ limit: '512kb' }));
-app.use(express.urlencoded({ extended: true }));
+// IMAGE GENERATION
+async function generateImage(prompt) {
+    const url =
+        'https://image.pollinations.ai/prompt/' +
+        encodeURIComponent(prompt) +
+        '?width=1024&height=1024&nologo=true';
 
-// ── Health check (Render uses this) ──
-app.get('/health', (_req, res) => {
+    const response = await axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: 90000
+    });
+
+    return Buffer.from(response.data);
+}
+
+// HEALTH
+app.get('/health', (req, res) => {
     res.json({
-        status: 'ok',
-        uptime: Math.floor(process.uptime()),
-        whatsapp: waConnected ? 'connected' : (waStarting ? 'pairing' : 'offline'),
+        status: 'OK',
+        whatsapp: waConnected ? 'connected' : 'offline',
+        uptime: Math.floor(process.uptime())
     });
 });
 
-// ── API: status ──
-app.get('/api/status', (_req, res) => {
+// STATUS
+app.get('/api/status', requireAdmin, (req, res) => {
     res.json({
         name: 'TALHA THE AI',
-        whatsapp: waConnected ? 'connected' : (waStarting ? 'pairing' : 'offline'),
-        phoneNumber: waPhoneNumber,
+        whatsapp: waConnected ? 'connected' : 'offline',
+        phone: waPhoneNumber,
         pairingCode,
-        uptime: Math.floor(process.uptime()),
+        model: GEMINI_MODEL
     });
 });
 
-// ── API: start WhatsApp pairing ──
-app.post('/api/wa/start', async (req, res) => {
-    const phone = (req.body?.phone || '').toString().replace(/[^0-9]/g, '');
-    if (!phone || phone.length < 8) {
-        return res.status(400).json({ error: 'সঠিক নম্বর দিন (country code সহ, + ছাড়া)' });
+// LOGS
+app.get('/api/logs', requireAdmin, (req, res) => {
+    res.json({ logs });
+});
+
+// WHATSAPP START
+app.post('/api/wa/start', requireAdmin, async (req, res) => {
+    const phone = String(req.body.phone || '')
+        .replace(/\D/g, '');
+
+    if (phone.length < 8 || phone.length > 15) {
+        return res.status(400).json({
+            error: 'সঠিক WhatsApp নম্বর দিন।'
+        });
     }
-    if (waConnected)  return res.json({ ok: true, message: 'WhatsApp ইতিমধ্যেই connected', phone: waPhoneNumber });
-    if (waStarting)   return res.json({ ok: true, message: 'পেয়ারিং চলছে', pairingCode, phone: waPhoneNumber });
 
-    waPhoneNumber       = phone;
-    waStarting          = true;
-    pairingCode         = null;
-    reconnectAttempts   = 0;
-    pushLog(`📱 Starting WhatsApp pairing for: ${phone}`);
+    if (waConnected) {
+        return res.json({
+            ok: true,
+            message: 'WhatsApp already connected'
+        });
+    }
 
-    startWhatsAppBot().catch(e => {
-        pushLog('❌ WA bot failed: ' + e.message);
-        waStarting = false;
+    if (waStarting || botStartPromise) {
+        return res.json({
+            ok: true,
+            message: 'Pairing already running',
+            pairingCode
+        });
+    }
+
+    waPhoneNumber = phone;
+    pairingCode = null;
+
+    startWhatsAppBot().catch(error => {
+        log('WhatsApp start error: ' + error.message);
     });
-    res.json({ ok: true, message: 'পেয়ারিং শুরু হচ্ছে...', phone });
+
+    res.json({
+        ok: true,
+        message: 'WhatsApp pairing started'
+    });
 });
 
-// ── API: reset session ──
-app.post('/api/wa/reset', async (req, res) => {
+// WHATSAPP RESET
+app.post('/api/wa/reset', requireAdmin, async (req, res) => {
     try {
-        if (waSocket) { try { waSocket.end(); } catch (_) {} waSocket = null; }
-        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        waConnected       = false;
-        waStarting        = false;
-        pairingCode       = null;
-        waPhoneNumber     = null;
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+
+        const oldSocket = waSocket;
+        waSocket = null;
+        waConnected = false;
+        waStarting = false;
+        pairingCode = null;
+        waPhoneNumber = null;
+        botStartPromise = null;
         reconnectAttempts = 0;
-        pushLog('🧹 WhatsApp session reset.');
-        if (req.is('application/json')) res.json({ ok: true });
-        else res.redirect('/');
-    } catch (e) {
-        res.status(500).json({ error: e.message });
+
+        if (oldSocket) {
+            try {
+                oldSocket.end();
+            } catch (_) {}
+        }
+
+        fs.rmSync(AUTH_DIR, {
+            recursive: true,
+            force: true
+        });
+
+        log('WhatsApp session reset');
+
+        res.json({
+            ok: true,
+            message: 'Session reset successful'
+        });
+
+    } catch (error) {
+        log('Reset error: ' + error.message);
+        res.status(500).json({
+            error: error.message
+        });
     }
 });
 
-// ── MAIN: Terminal Dashboard ──
-app.get('/', (_req, res) => {
+// DASHBOARD
+app.get('/', (req, res) => {
+    const status = waConnected
+        ? '🟢 CONNECTED'
+        : waStarting
+            ? '🟡 CONNECTING'
+            : '🔴 OFFLINE';
+
     const logHTML = logs.slice(-40).reverse()
-        .map(l => `<div class="line">&gt; ${escapeHtml(l)}</div>`).join('');
-
-    const statusBadge = waConnected
-        ? '<span class="ok">● CONNECTED</span>'
-        : (waStarting ? '<span class="warn">● PAIRING…</span>' : '<span class="off">● OFFLINE</span>');
-
-    const pairingBlock = pairingCode ? `
-        <div class="code-card">
-            <div class="code-label">📲 PAIRING CODE</div>
-            <div class="code-value">${pairingCode}</div>
-            <div class="code-hint">
-                WhatsApp খুলুন →
-                <b>Settings → Linked Devices → Link a Device → Link with phone number</b>
-                → এই কোডটি দিন
-            </div>
-        </div>` : '';
-
-    const formBlock = (waConnected || waStarting) ? '' : `
-        <div class="card">
-            <h3>📱 WhatsApp Bot Login</h3>
-            <p class="muted">Country code সহ আপনার WhatsApp নম্বর দিন (+ ছাড়া)।<br>
-            উদাহরণঃ <code>8801712345678</code></p>
-            <div id="waForm">
-                <input id="phone" type="tel" inputmode="numeric"
-                    placeholder="8801XXXXXXXXX" maxlength="15" />
-                <button id="startBtn" onclick="startWA()">🚀 LOGIN START</button>
-            </div>
-            <div id="formMsg" class="muted"></div>
-        </div>`;
-
-    const resetBlock = (waConnected || waStarting) ? `
-        <form method="POST" action="/api/wa/reset"
-              onsubmit="return confirm('Session reset হবে — আবার pair করতে হবে। চালিয়ে যাবেন?')">
-            <button type="submit" class="reset-btn">🧹 RESET SESSION</button>
-        </form>` : '';
-
-    const refreshSec = pairingCode || waStarting ? 5 : 14;
+        .map(item =>
+            `<div class="log">${escapeHtml(item)}</div>`
+        ).join('');
 
     res.send(`<!DOCTYPE html>
 <html lang="bn">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1"/>
-<meta name="theme-color" content="#05070d"/>
-<title>RASHD THE AI — WhatsApp Bot Terminal</title>
-<meta http-equiv="refresh" content="${refreshSec}"/>
-<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TALHA THE AI</title>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-html,body{background:#05070d;color:#7af0ff;font-family:'JetBrains Mono',monospace;min-height:100%}
+*{box-sizing:border-box}
 body{
-  padding:16px;max-width:820px;margin:0 auto;padding-bottom:30px;
-  background:
-    radial-gradient(ellipse at top,rgba(0,200,255,.08),transparent 60%),
-    radial-gradient(ellipse at bottom,rgba(120,0,255,.06),transparent 60%),
-    #05070d;
-  background-attachment:fixed;
+margin:0;padding:18px;background:#050b16;
+color:#eaf6ff;font-family:Arial,sans-serif;
+max-width:800px;margin:auto
 }
-body::before{
-  content:'';position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.35;
-  background-image:
-    linear-gradient(rgba(0,212,255,.04) 1px,transparent 1px),
-    linear-gradient(90deg,rgba(0,212,255,.04) 1px,transparent 1px);
-  background-size:40px 40px;
-}
-body>*{position:relative;z-index:1}
-
-/* Header */
-.header{
-  display:flex;align-items:center;gap:14px;padding:18px;
-  background:linear-gradient(135deg,rgba(0,30,60,.85),rgba(20,0,60,.7));
-  border:1px solid rgba(0,212,255,.3);border-radius:16px;margin-bottom:16px;
-  box-shadow:0 0 30px rgba(0,212,255,.12),inset 0 0 30px rgba(0,212,255,.04);
-  backdrop-filter:blur(8px);
-}
-.logo{
-  width:54px;height:54px;border-radius:14px;flex-shrink:0;
-  background:linear-gradient(135deg,#0044ff,#00d4ff,#00ffaa);
-  display:flex;align-items:center;justify-content:center;
-  font-family:'Orbitron',monospace;font-weight:900;font-size:14px;
-  color:#fff;letter-spacing:-1px;
-  box-shadow:0 0 24px rgba(0,212,255,.6),inset 0 0 12px rgba(255,255,255,.2);
-}
-.title{font-family:'Orbitron',monospace;font-size:1.15rem;color:#fff;letter-spacing:3px;text-shadow:0 0 12px rgba(0,212,255,.6)}
-.subtitle{font-size:.62rem;color:#7ab3d4;letter-spacing:4px;text-transform:uppercase;margin-top:4px}
-
-/* Status row */
-.status-row{
-  display:flex;flex-wrap:wrap;gap:10px;align-items:center;font-size:.78rem;
-  padding:12px 16px;background:rgba(0,15,35,.7);
-  border:1px solid rgba(0,212,255,.18);border-radius:12px;margin-bottom:14px;
-}
-.ok{color:#00ff99;text-shadow:0 0 8px rgba(0,255,150,.5)}
-.warn{color:#ffcc44;text-shadow:0 0 8px rgba(255,200,68,.5);animation:blink 1s infinite}
-.off{color:#ff5577}
-@keyframes blink{50%{opacity:.4}}
-.phone{color:#fff;font-weight:600;letter-spacing:1px}
-
-/* Cards */
 .card{
-  background:linear-gradient(135deg,rgba(0,25,55,.7),rgba(15,0,40,.5));
-  border:1px solid rgba(0,212,255,.22);padding:20px;border-radius:14px;margin-bottom:14px;
-  backdrop-filter:blur(6px);
+background:#101d30;border:1px solid #164d72;
+border-radius:16px;padding:18px;margin-bottom:16px
 }
-.card h3{
-  color:#00ffea;font-family:'Orbitron',monospace;letter-spacing:2px;
-  margin-bottom:8px;font-size:1rem;text-shadow:0 0 8px rgba(0,255,234,.4);
+h1{color:#00d9ff;font-size:25px}
+h2{color:#00d9ff;font-size:18px}
+input{
+width:100%;padding:14px;margin:8px 0;
+border-radius:9px;border:1px solid #28729a;
+background:#071321;color:white;font-size:15px
 }
-.card p,.muted{color:#9ec4dc;font-size:.82rem;line-height:1.6;margin-bottom:12px}
-code{background:rgba(0,40,80,.7);color:#00ffea;padding:3px 8px;border-radius:5px;font-size:.85rem;border:1px solid rgba(0,212,255,.2)}
-
-/* Form */
-#waForm{display:flex;flex-direction:column;gap:10px}
-input[type=tel]{
-  width:100%;padding:16px 18px;background:#020510;
-  border:1px solid rgba(0,212,255,.3);border-radius:12px;
-  color:#00d4ff;font-family:'JetBrains Mono',monospace;font-size:1.05rem;
-  outline:none;letter-spacing:2px;transition:all .2s;
-}
-input[type=tel]:focus{border-color:#00d4ff;box-shadow:0 0 0 3px rgba(0,212,255,.15),0 0 24px rgba(0,212,255,.4)}
 button{
-  padding:15px;background:linear-gradient(135deg,#0044cc,#00aaff,#0066ff);
-  background-size:200% 100%;border:none;color:#fff;font-weight:700;
-  border-radius:12px;cursor:pointer;font-family:'Orbitron',monospace;
-  font-size:.9rem;letter-spacing:3px;transition:all .25s;
-  box-shadow:0 4px 16px rgba(0,100,200,.4);
+width:100%;padding:14px;margin-top:8px;
+background:linear-gradient(90deg,#075dff,#00c8ff);
+border:0;border-radius:9px;color:white;
+font-weight:bold;font-size:15px
 }
-button:hover{background-position:100% 0;transform:translateY(-2px);box-shadow:0 0 28px rgba(0,200,255,.6)}
-button:active{transform:scale(.98)}
-button:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.reset-btn{
-  margin-top:14px;width:100%;padding:13px;font-size:.78rem;
-  background:linear-gradient(135deg,#5a1525,#a02538);
-  border:1px solid rgba(255,90,110,.4);color:#ffbbcc;
+.danger{background:#a32445}
+.status{font-size:18px;font-weight:bold}
+.code{
+padding:20px;text-align:center;background:white;
+color:#001528;border-radius:12px;font-size:28px;
+letter-spacing:6px;font-weight:bold
 }
-
-/* Pairing code card */
-.code-card{
-  background:linear-gradient(135deg,#fff,#d4f1ff,#fff);
-  color:#001020;padding:26px 20px;border-radius:18px;margin-bottom:16px;
-  text-align:center;border:2px solid #00d4ff;
-  box-shadow:0 0 50px rgba(0,212,255,.55);
-  animation:pulse 2s ease-in-out infinite;
+.logs{
+height:260px;overflow:auto;background:#020710;
+padding:12px;border-radius:10px;
+font-size:12px;color:#9deaff;
+overflow-wrap:anywhere
 }
-@keyframes pulse{
-  0%,100%{box-shadow:0 0 30px rgba(0,212,255,.4)}
-  50%{box-shadow:0 0 70px rgba(0,212,255,.8)}
-}
-.code-label{font-family:'Orbitron',monospace;font-size:.78rem;letter-spacing:4px;color:#003866;margin-bottom:10px}
-.code-value{font-family:'Orbitron',monospace;font-size:2.6rem;font-weight:900;letter-spacing:10px;color:#001020;word-break:break-all}
-.code-hint{font-size:.78rem;color:#003866;margin-top:14px;line-height:1.6}
-
-/* Terminal */
-.terminal-wrap{background:#020510;border:1px solid rgba(0,212,255,.25);border-radius:14px;overflow:hidden;margin-bottom:14px;box-shadow:inset 0 0 30px rgba(0,212,255,.05)}
-.terminal-bar{display:flex;align-items:center;gap:6px;padding:8px 14px;background:rgba(0,212,255,.08);border-bottom:1px solid rgba(0,212,255,.15);font-size:.7rem;color:#7ab3d4;letter-spacing:2px}
-.dot{width:10px;height:10px;border-radius:50%;background:#ff5577}
-.dot.y{background:#ffcc44}.dot.g{background:#00ff99}
-.terminal-bar .label{margin-left:auto;font-family:'Orbitron',monospace}
-.terminal{padding:14px;height:38vh;min-height:260px;overflow-y:auto;font-size:.8rem;line-height:1.8}
-.terminal::-webkit-scrollbar{width:6px}
-.terminal::-webkit-scrollbar-thumb{background:rgba(0,212,255,.4);border-radius:3px}
-.line{padding:2px 0;color:#9addff;word-break:break-word;border-left:2px solid transparent;padding-left:8px;transition:border .2s}
-.line:hover{border-left-color:#00d4ff;background:rgba(0,212,255,.04)}
-
-/* Misc */
-.section-title{color:#00ffea;font-family:'Orbitron',monospace;font-size:.82rem;letter-spacing:3px;margin:20px 0 10px 4px;text-shadow:0 0 8px rgba(0,255,234,.3)}
-#formMsg{margin-top:6px;color:#00ffea;font-size:.85rem;min-height:1.2em;letter-spacing:1px}
-.commands{font-size:.82rem;color:#9ec4dc;line-height:1.9;margin-top:6px}
-.commands b{color:#00ffea}
-
-/* Footer */
-.footer{margin-top:24px;padding:18px 16px;text-align:center;background:linear-gradient(135deg,rgba(0,20,50,.7),rgba(30,0,60,.5));border:1px solid rgba(0,212,255,.2);border-radius:14px}
-.footer .dev{font-family:'Orbitron',monospace;font-size:.95rem;letter-spacing:3px;background:linear-gradient(90deg,#00d4ff,#aa66ff,#00ffaa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;font-weight:800}
-.footer a{display:inline-block;margin-top:8px;color:#7ad8ff;text-decoration:none;font-size:.82rem;padding:6px 14px;border:1px solid rgba(0,212,255,.3);border-radius:20px;transition:all .2s}
-.footer a:hover{background:rgba(0,212,255,.12);box-shadow:0 0 14px rgba(0,212,255,.3)}
-.footer .tag{font-size:.65rem;color:#5a8aa8;margin-top:8px;letter-spacing:2px}
-
-@media(max-width:480px){
-  .code-value{font-size:1.9rem;letter-spacing:6px}
-  .title{font-size:.95rem;letter-spacing:2px}
-  .logo{width:46px;height:46px;font-size:12px}
-  body{padding:12px}
-}
+.log{padding:5px;border-bottom:1px solid #172b40}
+small,.hint{color:#a5bed2;line-height:1.6}
 </style>
 </head>
 <body>
 
-<div class="header">
-  <div class="logo">RTA</div>
-  <div>
-    <div class="title">RASHD THE AI</div>
-    <div class="subtitle">⚡ WhatsApp Bot Terminal ⚡</div>
-  </div>
+<div class="card">
+<h1>🤖 TALHA THE AI</h1>
+<p>Premium WhatsApp AI Assistant</p>
+<div class="status">${status}</div>
+<p class="hint">Model: ${escapeHtml(GEMINI_MODEL)}</p>
 </div>
 
-<div class="status-row">
-  Status: ${statusBadge}
-  ${waPhoneNumber ? `&nbsp;|&nbsp; <span class="phone">📱 ${escapeHtml(waPhoneNumber)}</span>` : ''}
+<div class="card">
+<h2>🔐 Admin Login</h2>
+<input id="token" type="password"
+placeholder="Enter ADMIN_TOKEN">
+<button onclick="login()">LOGIN</button>
+<p id="authMsg" class="hint"></p>
 </div>
 
-${pairingBlock}
-${formBlock}
+<div class="card">
+<h2>📱 WhatsApp Pairing</h2>
+<input id="phone" type="tel"
+placeholder="8801XXXXXXXXX">
+<button onclick="startWA()">START WHATSAPP</button>
+<button class="danger" onclick="resetWA()">RESET SESSION</button>
+<p id="waMsg" class="hint"></p>
 
-<div class="card" style="padding:16px 20px">
-  <h3>💡 Bot Commands</h3>
-  <div class="commands">
-    • <b>যেকোনো প্রশ্ন</b> → AI সাথে সাথে উত্তর দেবে (typing indicator সহ)<br>
-    • <b>/image সূর্যাস্ত</b> → ছবি তৈরি করবে<br>
-    • <b>একটা গাড়ির ছবি বানাও</b> → ছবি তৈরি করবে<br>
-    • <b>draw a cat</b> → ইংরেজিতেও কাজ করবে
-  </div>
+${pairingCode ? `
+<h2>Pairing Code</h2>
+<div class="code">${escapeHtml(pairingCode)}</div>
+<p class="hint">
+WhatsApp → Linked Devices → Link a Device →
+Link with phone number
+</p>` : ''}
 </div>
 
-<div class="section-title">📜 LIVE TERMINAL LOGS</div>
-<div class="terminal-wrap">
-  <div class="terminal-bar">
-    <span class="dot"></span><span class="dot y"></span><span class="dot g"></span>
-    <span class="label">rashd@ai:~$</span>
-  </div>
-  <div class="terminal">${logHTML}</div>
-</div>
-
-${resetBlock}
-
-<div class="footer">
-  <div class="dev">『 R A S H D 』</div>
-  <a href="https://t.me/v4zrasehd" target="_blank" rel="noopener">📩 t.me/v4zrasehd</a>
-  <div class="tag">DEVELOPED · MAINTAINED · POWERED BY RASHD</div>
+<div class="card">
+<h2>📜 Live Logs</h2>
+<div class="logs" id="logs">${logHTML}</div>
 </div>
 
 <script>
-async function startWA() {
-  const phone = document.getElementById('phone').value.trim();
-  const msg   = document.getElementById('formMsg');
-  const btn   = document.getElementById('startBtn');
-  if (!phone || phone.length < 8) { msg.textContent = '❌ সঠিক নম্বর দিন'; return; }
-  msg.textContent = '⏳ পেয়ারিং শুরু হচ্ছে...';
-  btn.disabled = true;
-  try {
-    const r = await fetch('/api/wa/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phone })
-    });
-    const d = await r.json();
-    msg.textContent = d.ok ? '✅ ' + d.message + ' — কোডের জন্য অপেক্ষা করুন...' : '❌ ' + (d.error || 'failed');
-    if (d.ok) setTimeout(() => location.reload(), 2500);
-    else btn.disabled = false;
-  } catch (err) {
-    msg.textContent = '❌ ' + err.message;
-    btn.disabled = false;
-  }
+let adminToken = sessionStorage.getItem('talha_token') || '';
+
+function headers(){
+return {
+'Content-Type':'application/json',
+'x-admin-token':adminToken
+};
 }
-document.getElementById('phone') &&
-  document.getElementById('phone').addEventListener('keydown', e => { if (e.key === 'Enter') startWA(); });
+
+async function login(){
+adminToken=document.getElementById('token').value.trim();
+
+try{
+const r=await fetch('/api/status',{
+headers:{'x-admin-token':adminToken}
+});
+const d=await r.json();
+
+if(!r.ok) throw new Error(d.error);
+
+sessionStorage.setItem('talha_token',adminToken);
+document.getElementById('authMsg').textContent=
+'✅ Admin Login Successful';
+
+refreshLogs();
+
+}catch(e){
+adminToken='';
+sessionStorage.removeItem('talha_token');
+document.getElementById('authMsg').textContent=
+'❌ '+e.message;
+}
+}
+
+async function startWA(){
+if(!adminToken){
+alert('আগে Admin Login করুন');
+return;
+}
+
+const phone=document.getElementById('phone').value.trim();
+
+try{
+const r=await fetch('/api/wa/start',{
+method:'POST',
+headers:headers(),
+body:JSON.stringify({phone})
+});
+
+const d=await r.json();
+
+if(!r.ok) throw new Error(d.error);
+
+document.getElementById('waMsg').textContent=
+'✅ '+d.message;
+
+setTimeout(()=>location.reload(),3000);
+
+}catch(e){
+document.getElementById('waMsg').textContent=
+'❌ '+e.message;
+}
+}
+
+async function resetWA(){
+if(!adminToken){
+alert('আগে Admin Login করুন');
+return;
+}
+
+if(!confirm('WhatsApp Session Reset করবেন?')) return;
+
+try{
+const r=await fetch('/api/wa/reset',{
+method:'POST',
+headers:headers(),
+body:JSON.stringify({})
+});
+
+const d=await r.json();
+if(!r.ok) throw new Error(d.error);
+
+alert(d.message);
+location.reload();
+
+}catch(e){
+alert(e.message);
+}
+}
+
+async function refreshLogs(){
+if(!adminToken) return;
+
+try{
+const r=await fetch('/api/logs',{
+headers:{'x-admin-token':adminToken}
+});
+
+const d=await r.json();
+if(!r.ok) return;
+
+document.getElementById('logs').innerHTML=
+d.logs.slice(-40).reverse()
+.map(x=>'<div class="log">'+
+String(x).replace(/[&<>"']/g,c=>({
+'&':'&amp;','<':'&lt;','>':'&gt;',
+'"':'&quot;',"'":'&#39;'
+}[c]))+'</div>').join('');
+
+}catch(e){}
+}
+
+if(adminToken){
+document.getElementById('token').value=adminToken;
+}
+
+setInterval(refreshLogs,8000);
 </script>
 </body>
 </html>`);
 });
 
-// ── Server startup ──
-app.listen(PORT, '0.0.0.0', () => {
-    pushLog(`✅ RASHD THE AI terminal running on port ${PORT}`);
-    pushLog(`📁 Auth directory: ${AUTH_DIR}`);
-
-    // Auto-resume if auth session exists
-    if (fs.existsSync(AUTH_DIR) && fs.readdirSync(AUTH_DIR).length > 0) {
-        pushLog('🔁 Existing session found — auto-resuming...');
-        waStarting = true;
-        startWhatsAppBot().catch(e => {
-            pushLog('❌ Auto-resume failed: ' + e.message);
-            waStarting = false;
-        });
-    } else {
-        pushLog('ℹ️ Open the terminal page and enter your WhatsApp number to login.');
-    }
-
-    // ── Self-ping to keep Render free tier awake ──
-    const selfUrl = process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL;
-    if (selfUrl) {
-        const pingUrl = selfUrl.replace(/\/$/, '') + '/health';
-        pushLog(`🏓 Self-ping enabled → ${pingUrl} (every 13 min)`);
-        setInterval(async () => {
-            try {
-                await axios.get(pingUrl, { timeout: 10000 });
-                pushLog('🏓 Self-ping OK');
-            } catch (e) {
-                pushLog('⚠️ Self-ping failed: ' + e.message);
-            }
-        }, 13 * 60 * 1000); // every 13 minutes
-    }
-});
-
-// ── Graceful shutdown ──
-['SIGINT', 'SIGTERM'].forEach(sig => {
-    process.on(sig, () => {
-        pushLog(`🛑 Received ${sig} — shutting down gracefully...`);
-        if (waSocket) { try { waSocket.end(); } catch (_) {} }
-        process.exit(0);
-    });
-});
-
-// ── WHATSAPP BOT ──
+// WHATSAPP BOT
 async function startWhatsAppBot() {
-    const {
-        default: makeWASocket,
-        useMultiFileAuthState,
-        delay,
-        fetchLatestBaileysVersion,
-        DisconnectReason,
-    } = require('@whiskeysockets/baileys');
+    if (botStartPromise) return botStartPromise;
 
-    const { Boom } = require('@hapi/boom');
+    botStartPromise = (async () => {
+        waStarting = true;
 
-    fs.mkdirSync(AUTH_DIR, { recursive: true });
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+        const {
+            default: makeWASocket,
+            useMultiFileAuthState,
+            fetchLatestBaileysVersion,
+            delay,
+            DisconnectReason
+        } = require('@whiskeysockets/baileys');
 
-    let version;
-    try {
-        const res = await fetchLatestBaileysVersion();
-        version = res.version;
-        pushLog(`📦 Baileys version: ${version.join('.')}`);
-    } catch {
-        version = [2, 3000, 1020576855]; // safe fallback version
-        pushLog('⚠️ Could not fetch Baileys version, using fallback.');
-    }
+        const { Boom } = require('@hapi/boom');
 
-    const sock = makeWASocket({
-        version,
-        auth: state,
-        logger: pino({ level: 'silent' }),
-        printQRInTerminal: false,
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
-        connectTimeoutMs: 60_000,
-        defaultQueryTimeoutMs: 30_000,
-        keepAliveIntervalMs: 25_000,
-        markOnlineOnConnect: true,
-    });
-    waSocket = sock;
+        fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-    // Request pairing code if not yet registered
-    if (!sock.authState.creds.registered) {
-        if (!waPhoneNumber) {
-            pushLog('⚠️ No phone number set. Enter your number on the terminal page.');
-            waStarting = false;
-            return;
-        }
-        pushLog('🔑 Requesting pairing code for ' + waPhoneNumber + '...');
-        await delay(3000);
+        const { state, saveCreds } =
+            await useMultiFileAuthState(AUTH_DIR);
+
+        let version;
+
         try {
-            pairingCode = await sock.requestPairingCode(waPhoneNumber);
-            pushLog('✅ Pairing code ready: ' + pairingCode);
-        } catch (err) {
-            pushLog('❌ Pairing error: ' + err.message);
-            waStarting = false;
-        }
-    }
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update;
-
-        if (connection === 'open') {
-            waConnected       = true;
-            waStarting        = false;
-            pairingCode       = null;
-            reconnectAttempts = 0;
-            pushLog('🎊 RASHD THE AI is ONLINE on WhatsApp!');
+            const latest = await fetchLatestBaileysVersion();
+            version = latest.version;
+            log('Baileys version: ' + version.join('.'));
+        } catch (error) {
+            log('Baileys version fetch failed: ' + error.message);
         }
 
-        if (connection === 'close') {
-            waConnected = false;
-            const code  = new Boom(lastDisconnect?.error)?.output?.statusCode;
-            const loggedOut = code === DisconnectReason.loggedOut;
+        const socket = makeWASocket({
+            ...(version ? { version } : {}),
+            auth: state,
+            logger: pino({ level: 'silent' }),
+            printQRInTerminal: false,
+            browser: ['TALHA THE AI', 'Chrome', '1.0'],
+            connectTimeoutMs: 60000,
+            keepAliveIntervalMs: 25000
+        });
 
-            if (loggedOut) {
-                pushLog('🚪 Logged out from WhatsApp. Please reset and re-pair.');
-                waStarting = false;
-                return;
-            }
+        waSocket = socket;
 
-            reconnectAttempts++;
-            const wait = Math.min(3000 * reconnectAttempts, 30000); // max 30s backoff
-            pushLog(`🔄 Disconnected (code ${code}). Reconnecting in ${wait / 1000}s… (attempt ${reconnectAttempts})`);
-            waStarting = true;
-            setTimeout(() => {
-                startWhatsAppBot().catch(e => {
-                    pushLog('❌ Reconnect failed: ' + e.message);
-                    waStarting = false;
-                });
-            }, wait);
-        }
-    });
+        socket.ev.on('creds.update', saveCreds);
 
-    const seenMsgs  = new Set();
-    const busyChats = new Set();
+        if (!state.creds.registered && waPhoneNumber) {
+            await delay(3000);
 
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-        const msg = messages[0];
-        if (!msg?.message || msg.key.fromMe) return;
-
-        const text = msg.message.conversation
-            || msg.message.extendedTextMessage?.text
-            || '';
-        if (!text.trim()) return;
-
-        const msgId = msg.key.id;
-        if (seenMsgs.has(msgId)) return;
-        seenMsgs.add(msgId);
-        if (seenMsgs.size > 500) seenMsgs.clear();
-
-        const jid = msg.key.remoteJid;
-        if (busyChats.has(jid)) {
-            pushLog(`⏭️ Skipped (busy): ${text.substring(0, 24)}`);
-            return;
-        }
-        busyChats.add(jid);
-        pushLog(`📩 WA: ${text.substring(0, 40)}`);
-
-        // Typing indicator helpers
-        let typingTimer = null;
-        const startTyping = async () => {
             try {
-                await sock.sendPresenceUpdate('available', jid);
-                await sock.sendPresenceUpdate('composing', jid);
-            } catch (_) {}
-            typingTimer = setInterval(() => {
-                sock.sendPresenceUpdate('composing', jid).catch(() => {});
-            }, 8000);
-        };
-        const stopTyping = async () => {
-            if (typingTimer) { clearInterval(typingTimer); typingTimer = null; }
-            try { await sock.sendPresenceUpdate('paused', jid); } catch (_) {}
-        };
+                pairingCode =
+                    await socket.requestPairingCode(waPhoneNumber);
 
-        try {
-            try { await sock.readMessages([msg.key]); } catch (_) {}
-            await startTyping();
+                log('Pairing code generated: ' + pairingCode);
 
-            const imgPrompt = extractImagePrompt(text);
-            if (imgPrompt) {
-                pushLog('🎨 Generating image: ' + imgPrompt.substring(0, 30));
-                try {
-                    const buffer = await fetchImageBuffer(imgPrompt);
-                    await stopTyping();
-                    await sock.sendMessage(jid, {
-                        image: buffer,
-                        caption: `🎨 "${imgPrompt}"\n\n— RASHD THE AI\n👨‍💻 Dev: 『 R A S H D 』 t.me/v4zrasehd`,
-                    });
-                    pushLog('🖼️ Image sent.');
-                } catch (imgErr) {
-                    pushLog('❌ Image error: ' + (imgErr.response?.status || imgErr.message));
-                    await stopTyping();
-                    await sock.sendMessage(jid, {
-                        text: '⚠️ ছবি তৈরি করতে সার্ভার এখন একটু ব্যস্ত (rate-limit)। ৩০ সেকেন্ড পরে আবার চেষ্টা করুন।',
-                    });
-                }
-            } else {
-                const reply = await askAI(text);
-                await stopTyping();
-                await sock.sendMessage(jid, { text: reply });
-                pushLog('📤 Reply sent.');
+            } catch (error) {
+                log('Pairing error: ' + error.message);
+                waStarting = false;
             }
-        } catch (e) {
-            await stopTyping();
-            pushLog('⚠️ Handler error: ' + e.message);
-        } finally {
-            busyChats.delete(jid);
         }
-    });
+
+        socket.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+
+            for (const msg of messages || []) {
+                if (!msg.message || msg.key.fromMe) continue;
+
+                if (msg.key.remoteJid === 'status@broadcast') continue;
+
+                const jid = msg.key.remoteJid;
+
+                const text =
+                    msg.message.conversation ||
+                    msg.message.extendedTextMessage?.text ||
+                    msg.message.imageMessage?.caption ||
+                    '';
+
+                if (!text.trim()) continue;
+
+                log('WhatsApp message: ' + text.slice(0, 50));
+
+                let typingTimer;
+
+                async function stopTyping() {
+                    if (typingTimer) clearInterval(typingTimer);
+
+                    try {
+                        await socket.sendPresenceUpdate('paused', jid);
+                    } catch (_) {}
+                }
+
+                try {
+                    try {
+                        await socket.readMessages([msg.key]);
+                    } catch (_) {}
+
+                    try {
+                        await socket.sendPresenceUpdate('composing', jid);
+
+                        typingTimer = setInterval(() => {
+                            socket.sendPresenceUpdate(
+                                'composing',
+                                jid
+                            ).catch(() => {});
+                        }, 8000);
+                    } catch (_) {}
+
+                    const imagePrompt = getImagePrompt(text);
+
+                    if (imagePrompt) {
+                        log('Generating image...');
+
+                        const buffer =
+                            await generateImage(imagePrompt);
+
+                        await stopTyping();
+
+                        await socket.sendMessage(jid, {
+                            image: buffer,
+                            caption: '🎨 Created by TALHA THE AI'
+                        });
+
+                        log('Image sent successfully');
+
+                    } else {
+                        const reply = await askAI(text);
+
+                        await stopTyping();
+
+                        await socket.sendMessage(jid, {
+                            text: reply
+                        });
+
+                        log('AI reply sent');
+                    }
+
+                } catch (error) {
+                    await stopTyping();
+
+                    log('Message handler error: ' + error.message);
+
+                    try {
+                        await socket.sendMessage(jid, {
+                            text: 'দুঃখিত, সার্ভারে সমস্যা হচ্ছে। একটু পরে আবার চেষ্টা করুন।'
+                        });
+                    } catch (_) {}
+                }
+            }
+        });
+
+        socket.ev.on('connection.update', update => {
+            const { connection, lastDisconnect } = update;
+
+            if (connection === 'open') {
+                waConnected = true;
+                waStarting = false;
+                pairingCode = null;
+                reconnectAttempts = 0;
+
+                log('🎉 TALHA THE AI WhatsApp connected!');
+            }
+
+            if (connection === 'close') {
+                waConnected = false;
+
+                const code =
+                    new Boom(lastDisconnect?.error)
+                    .output?.statusCode;
+
+                if (waSocket === socket) waSocket = null;
+
+                botStartPromise = null;
+
+                if (code === DisconnectReason.loggedOut) {
+                    waStarting = false;
+                    pairingCode = null;
+                    log('WhatsApp logged out. Reset and pair again.');
+                    return;
+                }
+
+                reconnectAttempts++;
+
+                const wait = Math.min(
+                    3000 * reconnectAttempts,
+                    30000
+                );
+
+                waStarting = true;
+
+                log('WhatsApp disconnected. Reconnecting...');
+
+                if (reconnectTimer) clearTimeout(reconnectTimer);
+
+                reconnectTimer = setTimeout(() => {
+                    reconnectTimer = null;
+
+                    startWhatsAppBot().catch(error => {
+                        log('Reconnect error: ' + error.message);
+                    });
+                }, wait);
+            }
+        });
+    })();
+
+    try {
+        await botStartPromise;
+    } catch (error) {
+        botStartPromise = null;
+        waStarting = false;
+        log('WhatsApp startup error: ' + error.message);
+        throw error;
+    }
 }
+
+// SERVER START
+const server = app.listen(PORT, '0.0.0.0', () => {
+    log('🚀 TALHA THE AI running on port ' + PORT);
+    log('Gemini Model: ' + GEMINI_MODEL);
+    log('Auth directory: ' + AUTH_DIR);
+
+    if (!ADMIN_TOKEN) log('WARNING: ADMIN_TOKEN missing');
+    if (!GEMINI_API_KEY) log('WARNING: GEMINI_API_KEY missing');
+
+    try {
+        if (
+            fs.existsSync(AUTH_DIR) &&
+            fs.readdirSync(AUTH_DIR).length > 0
+        ) {
+            log('Existing WhatsApp session found');
+            startWhatsAppBot().catch(error => {
+                log('Auto resume error: ' + error.message);
+            });
+        }
+    } catch (error) {
+        log('Auth directory error: ' + error.message);
+    }
+});
+
+// GRACEFUL SHUTDOWN
+function shutdown() {
+    log('Server shutting down...');
+
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+
+    if (waSocket) {
+        try {
+            waSocket.end();
+        } catch (_) {}
+    }
+
+    server.close(() => process.exit(0));
+
+    setTimeout(() => process.exit(0), 10000).unref();
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
