@@ -13,8 +13,8 @@ const PORT = process.env.PORT || 3000;
 // this relative resolution works perfectly.
 const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_info');
 
-// ── RASHD THE AI System Prompt ──
-const SYSTEM_PROMPT = `তুমি হলে "RASHD THE AI" — একজন বন্ধু এবং সাহায্যকারী।
+// ── TALHA THE AI System Prompt ──
+const SYSTEM_PROMPT = `তুমি হলে "TALHA THE AI" — একজন বন্ধু এবং সাহায্যকারী।
 
 তোমার ব্যক্তিত্ব:
 - তুমি ব্যবহারকারীর একজন বিশ্বস্ত বন্ধু এবং সব সময় সাহায্যের জন্য প্রস্তুত।
@@ -29,7 +29,7 @@ const SYSTEM_PROMPT = `তুমি হলে "RASHD THE AI" — একজন �
 সর্বদা সংক্ষিপ্ত, পরিষ্কার ও সহায়ক উত্তর দাও। মিথ্যা তথ্য দিও না — না জানলে সরাসরি বলে দাও।`;
 
 // ── State ──
-let logs      = ['🚀 RASHD THE AI starting up...'];
+let logs      = ['🚀 TALHA THE AI starting up...'];
 let pairingCode  = null;
 let waConnected  = false;
 let waSocket     = null;
@@ -69,30 +69,57 @@ function extractImagePrompt(text) {
     return null;
 }
 
+
 // ── AI API ──
-const GEM_ID  = 'c477280c-3abb-4a93-8b8a-fdc8e56830dc';
-const API_URL = `https://nxtai.zipohostbd.workers.dev/api/use?gem=${GEM_ID}`;
-const API_KEY = 'nxt_3a454c41e6a84aeead28d1fb4aec87a4';
+const API_URL =
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
 
 async function askAI(userMessage) {
     try {
-        const fullMessage = `${SYSTEM_PROMPT}\n\nব্যবহারকারীর প্রশ্ন: ${userMessage}`;
+        const API_KEY = process.env.GEMINI_API_KEY;
+
+        if (!API_KEY) {
+            throw new Error("GEMINI_API_KEY is missing");
+        }
+
         const res = await axios.post(
             API_URL,
-            { api_key: API_KEY, message: fullMessage },
             {
-                headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-                timeout: 30000,
+                systemInstruction: {
+                    parts: [{ text: SYSTEM_PROMPT }]
+                },
+                contents: [
+                    {
+                        role: "user",
+                        parts: [{ text: userMessage }]
+                    }
+                ],
+                generationConfig: {
+                    maxOutputTokens: 2048
+                }
+            },
+            {
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": API_KEY
+                },
+                timeout: 30000
             }
         );
-        const d = res.data;
-        return d.message || d.response || d.reply || d.text || d.content
-            || '⚠️ কোনো উত্তর পাওয়া যায়নি।';
+
+        return res.data?.candidates?.[0]?.content?.parts
+            ?.map(part => part.text || "")
+            .join("")
+            || "⚠️ কোনো উত্তর পাওয়া যায়নি।";
+
     } catch (err) {
-        pushLog('❌ AI Error: ' + (err.response?.status || err.message));
-        return '⚠️ দুঃখিত, AI সার্ভারে সমস্যা হচ্ছে। একটু পরে আবার চেষ্টা করুন।';
+        pushLog("❌ AI Error: " +
+            (err.response?.status || err.message));
+
+        return "⚠️ দুঃখিত, AI সার্ভারে সমস্যা হচ্ছে। একটু পরে আবার চেষ্টা করুন।";
     }
 }
+
 
 // ── Image generation via Pollinations (free, no key needed) ──
 function imageUrlFor(prompt) {
@@ -140,7 +167,7 @@ app.get('/health', (_req, res) => {
 // ── API: status ──
 app.get('/api/status', (_req, res) => {
     res.json({
-        name: 'RASHD THE AI',
+        name: 'TALHA THE AI',
         whatsapp: waConnected ? 'connected' : (waStarting ? 'pairing' : 'offline'),
         phoneNumber: waPhoneNumber,
         pairingCode,
