@@ -1,24 +1,23 @@
+
 services:
   - type: web
-    name: rashd-the-ai
+    name: talha-the-ai
     runtime: node
     plan: free
-    region: singapore   # Asia-closest region for BD users
-    buildCommand: npm install --omit=dev
-    startCommand: node index.js
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
     healthCheckPath: /health
     envVars:
-      - key: NODE_VERSION
-        value: "20"
       - key: NODE_ENV
         value: production
-      # Set this to your Render service URL after first deploy
-      # e.g. https://rashd-chatbot.onrender.com
-      # This enables self-ping to prevent free-tier sleep
-      - key: RENDER_EXTERNAL_URL
+      - key: PORT
+        value: "10000"
+      - key: GEMINI_API_KEY
         sync: false
-    autoDeploy: true
-    disk:
-      name: wa-auth
-      mountPath: /opt/render/project/src/auth_info
-      sizeGB: 1
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: AUTH_DIR
+        value: /opt/render/project/src/auth_info
